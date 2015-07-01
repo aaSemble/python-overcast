@@ -265,6 +265,9 @@ class DeploymentRunner(object):
         if 'neutron' not in self.conncache:
             ks = self.get_keystone_session()
             self.conncache['neutron'] = neutronclient.Client('2.0', session=ks)
+            if 'rackspacecloud' in self.conncache['neutron'].get_auth_info()['endpoint_url']:
+                # facepalm
+                self.conncache['neutron'].action_prefix = ''
         return self.conncache['neutron']
 
     def _map_network(self, network):

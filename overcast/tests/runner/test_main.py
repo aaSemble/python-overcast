@@ -39,6 +39,9 @@ small = 34fb3740-d158-472c-8520-017278c75008
 
 [routers]
 * = 61047deb-b0bf-4668-8325-d853d5d53c40
+
+[volumes]
+default = 10
 '''
 
 class NodeTests(unittest.TestCase):
@@ -70,24 +73,13 @@ class NodeTests(unittest.TestCase):
     def test_build(self, time, create_nics, get_cinder_client, get_neutron_client, get_nova_client):
         self.node.info['image'] = 'someimage'
         self.node.info['flavor'] = 'someflavor'
-        self.node.info['disk'] = 10
+        self.node.info['boot_volume'] = 10
         self.node.info['networks'] = mock.sentinel.Networks
 
         novaclient = get_nova_client.return_value
         novaclient.flavors.get.return_value = 'flavor_obj'
         neutronclient = get_neutron_client.return_value
 
-        cinderclient = get_cinder_client.return_value
-        class Volume(object):
-            def __init__(self, uuid):
-                self.id = uuid
-                self.statuses = ['downloading', 'downloading', 'available']
-
-            @property
-            def status(self):
-                return self.statuses.pop()
-
-        cinderclient.volumes.get.return_value = Volume('voluuid')
         create_nics.return_value = ['portuuid1', 'portuuid2']
 
         self.node.build()
@@ -95,10 +87,15 @@ class NodeTests(unittest.TestCase):
         create_nics.assert_called_with(mock.sentinel.Networks)
         novaclient.flavors.get.assert_called_with('someflavor')
 
+        bdm_v2 = [{'source_type': 'image', 'uuid': 'someimage',
+            'destination_type': 'volume', 'volume_size': 10,
+            'delete_on_termination': 'true', 'boot_index': '0'}]
+
+
         novaclient.servers.create.assert_called_with('name', userdata=None,
                                                      nics=[{'port-id': 'portuuid1'}, {'port-id': 'portuuid2'}],
                                                      image=None,
-                                                     block_device_mapping={'vda': 'voluuid:::1'},
+                                                     block_device_mapping_v2=bdm_v2,
                                                      key_name=None, flavor='flavor_obj')
 
     def test_floating_ip(self):
@@ -168,7 +165,8 @@ class MainTests(unittest.TestCase):
                               {'flavors': {'small': '34fb3740-d158-472c-8520-017278c75008'},
                                'images': {'trusty': '7cd9416f-9167-4371-a04a-a7939c5372ab'},
                                'networks': {'common': 'b2b2f6a6-228f-4d42-b4f7-0d340b3390e7'},
-                               'routers': {'*': '61047deb-b0bf-4668-8325-d853d5d53c40'}})
+                               'routers': {'*': '61047deb-b0bf-4668-8325-d853d5d53c40'},
+                               'volumes': {'default': '10'}})
             m.assert_called_once_with('.overcast.mappings.ini', 'r')
 
     def test_find_weak_refs(self):
@@ -619,12 +617,10 @@ class MainTests(unittest.TestCase):
         self.dr.create_security_group('secgroupname', None)
         nc.create_security_group.assert_called_once_with({'security_group': {'name': 'secgroupname'}})
 
-    @mock.patch('overcast.runner.DeploymentRunner.create_port')
-    @mock.patch('overcast.runner.DeploymentRunner.get_nova_client')
-    @mock.patch('overcast.runner.DeploymentRunner.get_neutron_client')
-    @mock.patch('overcast.runner.DeploymentRunner.get_cinder_client')
-    @mock.patch('overcast.runner.time')
-    def test_create_node(self, time, get_cinder_client, get_neutron_client, get_nova_client, create_port):
+
+    def _test_create_nodes(self, time, get_neutron_client, get_nova_client,
+            create_port, volume_size, mappings, bdm=None, image=None):
+        """Common code to test create_servers"""
         nc = get_nova_client.return_value
         self.dr.record_resource = mock.MagicMock()
 
@@ -640,30 +636,17 @@ class MainTests(unittest.TestCase):
 
         self.dr.networks = {'ephemeral': 'theoneIjustcreated'}
         self.dr.secgroups = {}
-        self.dr.mappings = {'images': {'trusty': 'trustyuuid'},
-                            'flavors': {'small': 'smallid'}}
+        self.dr.mappings = mappings
 
         node = overcast.runner.Node('test1_x123',
                                     {'image': 'trusty',
                                      'flavor': 'small',
-                                     'disk': 10,
+                                     'boot_volume': volume_size,
                                      'networks': [{'network': 'ephemeral', 'assign_floating_ip': True},
                                                   {'network': 'passedthrough'}]},
                                     userdata='foo',
                                     keypair='key_x123',
                                     runner=self.dr)
-
-        cinderclient = get_cinder_client.return_value
-        class Volume(object):
-            def __init__(self, uuid):
-                self.id = uuid
-                self.statuses = ['downloading', 'downloading', 'available']
-
-            @property
-            def status(self):
-                return self.statuses.pop()
-
-        cinderclient.volumes.get.return_value = Volume('voluuid')
 
         node.build()
 
@@ -672,8 +655,8 @@ class MainTests(unittest.TestCase):
         nc.servers.create.assert_called_with('test1_x123',
                                              nics=[{'port-id': 'nicuuid1'},
                                                    {'port-id': 'nicuuid2'}],
-                                             block_device_mapping={'vda': 'voluuid:::1'},
-                                             image=None,
+                                             block_device_mapping_v2=bdm,
+                                             image=image,
                                              userdata='foo',
                                              key_name='key_x123',
                                              flavor='smallflavorobject')
@@ -681,6 +664,49 @@ class MainTests(unittest.TestCase):
         self.dr.record_resource.assert_any_call('port', 'nicuuid1')
         self.dr.record_resource.assert_any_call('port', 'nicuuid2')
         self.dr.record_resource.assert_any_call('server', 'serveruuid')
+
+
+
+
+    @mock.patch('overcast.runner.DeploymentRunner.create_port')
+    @mock.patch('overcast.runner.DeploymentRunner.get_nova_client')
+    @mock.patch('overcast.runner.DeploymentRunner.get_neutron_client')
+    @mock.patch('overcast.runner.time')
+    def test_create_node_without_map_boot_from_volume(self, time, get_neutron_client, get_nova_client, create_port):
+        mappings = {'images': {'trusty': 'trustyuuid'},
+                    'flavors': {'small': 'smallid'}}
+        bdm = [{'source_type': 'image', 'uuid': 'trustyuuid',
+                    'destination_type': 'volume', 'volume_size': 10,
+                    'delete_on_termination': 'true', 'boot_index': '0'}]
+
+        self._test_create_nodes(time, get_neutron_client, get_nova_client, create_port, 10, mappings, bdm)
+
+
+    @mock.patch('overcast.runner.DeploymentRunner.create_port')
+    @mock.patch('overcast.runner.DeploymentRunner.get_nova_client')
+    @mock.patch('overcast.runner.DeploymentRunner.get_neutron_client')
+    @mock.patch('overcast.runner.time')
+    def test_create_node_with_map_boot_from_volume(self, time, get_neutron_client, get_nova_client, create_port):
+        mappings = {'images': {'trusty': 'trustyuuid'},
+                    'flavors': {'small': 'smallid'},
+                    'volumes': {'default': 100}}
+        bdm = [{'source_type': 'image', 'uuid': 'trustyuuid',
+            'destination_type': 'volume', 'volume_size': 100,
+            'delete_on_termination': 'true', 'boot_index': '0'}]
+
+        self._test_create_nodes(time, get_neutron_client, get_nova_client, create_port, 'default', mappings, bdm)
+
+
+    @mock.patch('overcast.runner.DeploymentRunner.create_port')
+    @mock.patch('overcast.runner.DeploymentRunner.get_nova_client')
+    @mock.patch('overcast.runner.DeploymentRunner.get_neutron_client')
+    @mock.patch('overcast.runner.time')
+    def test_create_node_with_map_boot_from_image(self, time, get_neutron_client, get_nova_client, create_port):
+        mappings = {'images': {'trusty': 'trustyuuid'},
+                    'flavors': {'small': 'smallid'}}
+
+        self._test_create_nodes(time, get_neutron_client, get_nova_client, create_port, 'default', mappings, image='trustyuuid')
+
 
     def test_list_refs_human(self):
         self._test_list_refs(False, 'Images:\n  trusty\n\nFlavors:\n  bootstrap\n')
